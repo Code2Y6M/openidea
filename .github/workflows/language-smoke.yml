@@ -57,6 +57,9 @@ on:
     paths: *paths
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: language-smoke-${{ github.ref }}
   # A new push supersedes a PR's run; on main every merge runs to the end (and saves the cache).
@@ -72,7 +75,9 @@ jobs:
   # run none; anything else runs them all. Pushes and manual runs always run them all.
   changes:
     name: Changes
-    runs-on: ubuntu-latest
+    # Self-hosted runners (scripts/selfhost-runner) only for trusted events, and only while the
+    # SELFHOSTED_RUNNERS repository variable is 'true': runs-on cannot fall back when none is online.
+    runs-on: ${{ vars.SELFHOSTED_RUNNERS == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "openidea-selfhosted"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
       pull-requests: read
@@ -140,33 +145,64 @@ jobs:
       fail-fast: false
       matrix:
         language: ${{ fromJSON(needs.changes.outputs.languages) }}
-    # C/C++ debug with GDB, whose DAP interpreter needs 14+: 22.04 ships 12.1, 24.04 ships 15.
-    runs-on: ${{ (matrix.language == 'c' || matrix.language == 'cpp') && 'ubuntu-24.04' || 'ubuntu-22.04' }}
+    # Self-hosted runners (scripts/selfhost-runner) only for trusted events, and only while the
+    # SELFHOSTED_RUNNERS repository variable is 'true': runs-on cannot fall back when none is online.
+    runs-on: ${{ vars.SELFHOSTED_RUNNERS == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "openidea-selfhosted"]') || 'ubuntu-latest' }}
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Tool versions, shared with the evals (pnpm eval).
       - run: grep -E '^[A-Z0-9_]+=' .github/tool-versions.env >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with: { components: "rust-analyzer, rustfmt" }
-      # One build cache for every language; main saves it.
+      # Self-hosted runners keep persistent local Cargo caches; GitHub-hosted runners share one cache.
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment != 'self-hosted'
         with:
           shared-key: language-smoke
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.language == 'rust' }}
+      - name: Persistent Cargo target dir
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          echo "CARGO_INCREMENTAL=1" >> "$GITHUB_ENV"
+          size=$(du -sm "$CARGO_TARGET_DIR" 2>/dev/null | cut -f1 || true)
+          if [ "${size:-0}" -gt 40000 ]; then
+            echo "$CARGO_TARGET_DIR is ${size} MB; clearing it"
+            rm -rf "$CARGO_TARGET_DIR"
+          fi
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v5
         with: { version: 11 }
-      - uses: actions/setup-node@v4
-        with: { node-version: 22, cache: pnpm }
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: ${{ runner.environment != 'self-hosted' && 'pnpm' || '' }}
+          package-manager-cache: ${{ runner.environment != 'self-hosted' }}
       - if: matrix.language == 'typescript'
         run: npm install --global "@vtsls/language-server@$VTSLS" "typescript@$TYPESCRIPT"
 
-      # The smoke builds the c-app fixture and debugs it with GDB's own DAP interpreter.
+      # The smoke checks C/C++ with clangd and debugs c-app with GDB's own DAP interpreter (GDB 14+).
       - if: matrix.language == 'c' || matrix.language == 'cpp'
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gdb
+          pkgs=()
+          command -v clangd >/dev/null || pkgs+=(clangd)
+          command -v gdb >/dev/null || pkgs+=(gdb)
+          if [ "${#pkgs[@]}" -gt 0 ]; then
+            sudo apt-get update
+            sudo apt-get install -y "${pkgs[@]}"
+          fi
+          major=$(gdb --version | head -n1 | grep -Eo '[0-9]+\.[0-9]+' | head -n1 | cut -d. -f1)
+          if [ "${major:-0}" -lt 14 ]; then
+            gdb_dir="$HOME/.cache/gdb-14"
+            if [ ! -x "$gdb_dir/bin/gdb" ]; then
+              case "$(uname -m)" in x86_64) plat=linux-64 ;; aarch64) plat=linux-aarch64 ;; esac
+              curl -fsSL "https://micro.mamba.pm/api/micromamba/$plat/latest" | tar -xj -C "$RUNNER_TEMP" bin/micromamba
+              "$RUNNER_TEMP/bin/micromamba" create -q -y -p "$gdb_dir" -c conda-forge "gdb>=14"
+            fi
+            echo "$gdb_dir/bin" >> "$GITHUB_PATH"
+          fi
 
       - if: matrix.language == 'python'
         uses: actions/setup-python@v5
@@ -185,6 +221,7 @@ jobs:
         with: { distribution: temurin, java-version: "${{ env.JAVA }}" }
       - if: matrix.language == 'java'
         run: |
+          command -v mvn >/dev/null || { sudo apt-get update && sudo apt-get install -y maven; }
           mkdir -p "$RUNNER_TEMP/jdtls"
           curl -fsSL "https://download.eclipse.org/jdtls/milestones/${JDTLS%-*}/jdt-language-server-$JDTLS.tar.gz" \
             | tar xz -C "$RUNNER_TEMP/jdtls"
@@ -219,7 +256,9 @@ jobs:
         run: cargo test --locked -p ide-host --test project_smoke -- --ignored --exact python_venv
 
       - run: pnpm install --frozen-lockfile
-      - run: cargo build --locked -p ide-host --bin openidea-server
+      - run: |
+          cargo build --locked -p ide-host --bin openidea-server
+          echo "OPENIDEA_SERVER=${CARGO_TARGET_DIR:-$PWD/target}/debug/openidea-server" >> "$GITHUB_ENV"
       - run: pnpm smoke smoke/run.test.ts -t "^${{ matrix.language }}$"
       - run: pnpm smoke smoke/debug.test.ts -t "^${{ matrix.language }}$"
         # The IDE installs the debugger from GitHub releases: authenticated, against rate limits.
